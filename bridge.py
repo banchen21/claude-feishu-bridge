@@ -293,6 +293,15 @@ class BotRunner:
         chat_type = event.get("chat_type", "p2p")
         message_id = event.get("message_id", "")
         sender_id = event.get("sender_id", "")
+        # lark-cli may nest sender_id inside sender object
+        if not sender_id:
+            sender = event.get("sender", {})
+            if isinstance(sender, dict):
+                sid = sender.get("sender_id", {})
+                if isinstance(sid, dict):
+                    sender_id = sid.get("open_id", "")
+                elif isinstance(sid, str):
+                    sender_id = sid
         content = event.get("content", "").strip()
 
         if not content or not message_id:
