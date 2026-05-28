@@ -51,28 +51,37 @@ def save_json(path: Path, data):
 
 
 def resolve_claude(bot_name: str, bot_cfg: dict, all_cfg: dict) -> dict:
-    """Resolve Claude config for a bot, falling back to env vars then sibling bots."""
-    if "claude" in bot_cfg and bot_cfg["claude"]:
-        return bot_cfg["claude"]
+    """Resolve Claude config for a bot, falling back to env vars then sibling bots.
+    If a bot has a partial claude block, it's deep-merged with the fallback base."""
+    own = bot_cfg.get("claude") or {}
 
-    # Fallback 1: environment variables
+    # Find fallback base
+    base = {}
     env_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
     env_url = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("CLAUDE_BASE_URL")
     if env_key and env_url:
-        return {
+        base = {
             "api_key": env_key,
             "base_url": env_url,
             "models": {"default": "mimo-v2.5", "thinking": "mimo-v2.5-pro"},
             "max_tokens": 8192,
             "system_prompt": "你是一个通过飞书与用户交流的AI助手。回答简洁清晰。",
         }
+    else:
+        for name, cfg in all_cfg.get("bots", {}).items():
+            if name != bot_name and "claude" in cfg and cfg["claude"]:
+                base = cfg["claude"]
+                break
 
-    # Fallback 2: inherit from a sibling bot that has claude config
-    for name, cfg in all_cfg.get("bots", {}).items():
-        if name != bot_name and "claude" in cfg and cfg["claude"]:
-            return cfg["claude"]
+    if not own and not base:
+        raise RuntimeError(f"Bot '{bot_name}' has no Claude config and no env vars or sibling to inherit from")
 
-    raise RuntimeError(f"Bot '{bot_name}' has no Claude config and no env vars or sibling to inherit from")
+    # Deep merge: own + base (own wins)
+    merged = dict(base)
+    merged.update(own)
+    if "models" in own and "models" in base:
+        merged["models"] = {**base["models"], **own["models"]}
+    return merged
 
 
 def load_config():
@@ -114,7 +123,7 @@ class BotRunner:
         self.models = cc["models"]
         self.max_tokens = cc["max_tokens"]
         self.system_prompt = cc["system_prompt"]
-        self.bot_name = name  # for identity awareness in replies
+        self.display_name = config.get("display_name", name)
 
         self.feishu_profile = config["feishu_profile"]
         self.feishu_app_id = config["feishu_app_id"]
@@ -234,7 +243,7 @@ class BotRunner:
             resp = self.claude.messages.create(
                 model=model,
                 max_tokens=self.max_tokens,
-                system=f"你的名字叫{self.bot_name}。{self.system_prompt}",
+                system=f"你的名字叫{self.display_name}。{self.system_prompt}",
                 messages=messages,
             )
             text = "".join(b.text for b in resp.content if b.type == "text")
