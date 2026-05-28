@@ -21,8 +21,13 @@ if sys.platform == "win32":
 
 import httpx
 
-CONFIG_PATH = Path(__file__).parent / "bridge-config.json"
-DATA_DIR = Path(__file__).parent
+if getattr(sys, 'frozen', False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).parent
+
+CONFIG_PATH = APP_DIR / "bridge-config.json"
+DATA_DIR = APP_DIR
 CLI_SESSIONS_DIR = DATA_DIR / ".cli-sessions"  # dedicated cwd for Claude CLI subprocess
 
 # Resolve lark-cli binary (handle Windows .cmd extension)
@@ -436,6 +441,51 @@ class BotRunner:
 
 
 # ===========================================================================
+# Profile auto-registration
+# ===========================================================================
+
+def _get_profiles() -> dict[str, bool]:
+    """Return dict of {profile_name: is_active} from lark-cli."""
+    try:
+        r = subprocess.run(
+            [LARK_CLI, "profile", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return {}
+        profiles = json.loads(r.stdout)
+        return {p["name"]: p.get("active", False) for p in profiles}
+    except Exception:
+        return {}
+
+
+def _sync_profiles(bots_cfg: dict):
+    """Ensure every bot's feishu_profile exists in lark-cli. Auto-create if missing."""
+    existing = _get_profiles()
+
+    for name, bot_cfg in bots_cfg.items():
+        profile = bot_cfg.get("feishu_profile", "")
+        app_id = bot_cfg.get("feishu_app_id", "")
+        app_secret = bot_cfg.get("feishu_app_secret", "")
+        if not profile or not app_id or not app_secret:
+            continue
+        if profile in existing:
+            print(f"  [OK] profile '{profile}' exists")
+            continue
+
+        print(f"  [{name}] Registering profile '{profile}' (app: {app_id[:14]}...) ...")
+        r = subprocess.run(
+            [LARK_CLI, "profile", "add", "--name", profile, "--app-id", app_id,
+             "--brand", "feishu", "--use", "--app-secret-stdin"],
+            input=app_secret, capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            print(f"  [{name}] WARN: profile register failed: {r.stderr or r.stdout}")
+        else:
+            print(f"  [{name}] profile '{profile}' registered")
+
+
+# ===========================================================================
 # Bridge — orchestrates all bots
 # ===========================================================================
 
@@ -444,6 +494,9 @@ class Bridge:
         cfg = load_config()
         self.bots: list[BotRunner] = []
         self.gui_server = gui_server
+
+        _sync_profiles(cfg["bots"])
+
         for name, bot_cfg in cfg["bots"].items():
             self.bots.append(BotRunner(name, bot_cfg))
 
@@ -515,7 +568,7 @@ def main():
         from importlib.machinery import SourceFileLoader
         import uvicorn
 
-        gui_path = str(DATA_DIR / "bridge-gui.py")
+        gui_path = str(APP_DIR / "bridge-gui.py")
         gui_module = SourceFileLoader("bridge_gui", gui_path).load_module()
         gui_app = gui_module.create_app(embedded=True)
 

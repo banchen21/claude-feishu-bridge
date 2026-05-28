@@ -23,7 +23,10 @@ if sys.platform == "win32":
     _orig_stdout = sys.stdout
     sys.stdout = io.TextIOWrapper(_orig_stdout.buffer, encoding='utf-8', line_buffering=True)
 
-BRIDGE_DIR = Path(__file__).parent
+if getattr(sys, 'frozen', False):
+    BRIDGE_DIR = Path(sys.executable).parent
+else:
+    BRIDGE_DIR = Path(__file__).parent
 CONFIG_PATH = BRIDGE_DIR / "bridge-config.json"
 
 # Resolve lark-cli

@@ -9,3 +9,9 @@ bridge-last-msg-*.json
 __pycache__/
 *.pyc
 .claude/
+
+# PyInstaller
+build/
+dist/
+*.spec
+*.exe
