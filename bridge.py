@@ -22,6 +22,7 @@ import httpx
 
 CONFIG_PATH = Path(__file__).parent / "bridge-config.json"
 DATA_DIR = Path(__file__).parent
+CLI_SESSIONS_DIR = DATA_DIR / ".cli-sessions"  # dedicated cwd for Claude CLI subprocess
 
 # Resolve lark-cli binary (handle Windows .cmd extension)
 _LARK_CLI = shutil.which("lark-cli")
@@ -106,15 +107,9 @@ class BotRunner:
         self.feishu_app_secret = config["feishu_app_secret"]
         self.feishu_base = "https://open.feishu.cn"
 
-        self.max_context = config.get("max_context_messages", 20)
-
-        self.session_file = DATA_DIR / f"bridge-sessions-{name}.json"
         self.msg_file = DATA_DIR / f"bridge-last-msg-{name}.json"
-
-        self.sessions = load_json(self.session_file, {})
         self._init_sessions: set[str] = set()
         self._processing: set[str] = set()
-        self._lock = asyncio.Lock()
         self.last_msg_ids: dict[str, float] = load_json(self.msg_file, {})
         self._tenant_token: str | None = None
         self._token_expire: float = 0
@@ -253,14 +248,6 @@ class BotRunner:
 
     # -- Claude CLI --
 
-    def _save_to_session(self, session_key: str, role: str, content: str):
-        if session_key not in self.sessions:
-            self.sessions[session_key] = []
-        self.sessions[session_key].append({"role": role, "content": content})
-        if len(self.sessions[session_key]) > self.max_context * 2:
-            self.sessions[session_key] = self.sessions[session_key][-self.max_context * 2:]
-        save_json(self.session_file, self.sessions)
-
     def _call_claude_sync(self, session_key: str, user_msg: str) -> str:
         """Call Claude CLI. Creates the session on first use, resumes thereafter."""
         session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"bridge.{self.name}.{session_key}"))
@@ -287,7 +274,8 @@ class BotRunner:
 
         def run(args):
             try:
-                p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", env=env, timeout=timeout)
+                p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                                   env=env, cwd=str(CLI_SESSIONS_DIR), timeout=timeout)
                 return p.returncode, (p.stdout or ""), (p.stderr or "")
             except subprocess.TimeoutExpired:
                 return -1, "", "timeout"
@@ -312,7 +300,6 @@ class BotRunner:
             print(f"[{self.name}] CLI empty stdout, stderr={stderr[:200]}")
             return "[错误] Claude CLI 返回为空"
         text = stdout.strip()
-        self._save_to_session(session_key, "assistant", text)
         return text
 
     async def _call_claude_async(self, session_key: str, user_msg: str) -> str:
@@ -370,7 +357,6 @@ class BotRunner:
         print(f"[{self.name}] {chat_type}:{chat_id[:12]}... | {enriched[:80]}")
 
         session_key = f"{chat_type}:{chat_id}"
-        self._save_to_session(session_key, "user", enriched)
 
         # Group messages: only reply if @mentioned
         if chat_type == "group" and self._bot_open_id:
@@ -510,6 +496,8 @@ def main():
         print(f"ERROR: {LARK_CLI} not found in PATH.")
         print("Install: npm install -g @larksuite/cli")
         sys.exit(1)
+
+    CLI_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     bridge = Bridge()
     try:

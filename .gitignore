@@ -8,3 +8,4 @@ bridge-last-msg-*.json
 # Python
 __pycache__/
 *.pyc
+.claude/
