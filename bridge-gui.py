@@ -2,28 +2,26 @@
 Claude <-> Feishu Bridge — Web Dashboard
 FastAPI server for managing multi-bot configurations, profiles, and live log streaming.
 Usage: python bridge-gui.py [--port 8080]
+       python bridge.py --gui          (embedded mode, bridge + GUI in same process)
 """
 import json
 import os
 import shutil
 import sys
-import time
-import asyncio
 import subprocess
 import argparse
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 import uvicorn
 
 if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+    _orig_stdout = sys.stdout
+    sys.stdout = io.TextIOWrapper(_orig_stdout.buffer, encoding='utf-8', line_buffering=True)
 
 BRIDGE_DIR = Path(__file__).parent
 CONFIG_PATH = BRIDGE_DIR / "bridge-config.json"
@@ -38,8 +36,6 @@ if not _LARK_CLI:
             _LARK_CLI = _p
             break
 LARK_CLI = _LARK_CLI or "lark-cli"
-
-app = FastAPI(title="Claude-Feishu Bridge", version="2.0")
 
 # ── Global state ──
 bridge_process: subprocess.Popen | None = None
@@ -65,7 +61,6 @@ def now_str():
 
 
 def broadcast_log(line: str):
-    """Send a log line to all connected WebSocket clients."""
     ts = now_str()
     entry = f"[{ts}] {line}"
     log_buffer.append(entry)
@@ -82,7 +77,6 @@ def broadcast_log(line: str):
 
 
 def run_lark(*args) -> tuple[int, str, str]:
-    """Run a lark-cli command, return (code, stdout, stderr)."""
     try:
         r = subprocess.run(
             [LARK_CLI, *args],
@@ -92,200 +86,6 @@ def run_lark(*args) -> tuple[int, str, str]:
     except Exception as e:
         return -1, "", str(e)
 
-
-# ═══════════════════════════════════════════════════
-# REST API
-# ═══════════════════════════════════════════════════
-
-@app.get("/api/status")
-async def api_status():
-    global bridge_process
-    running = bridge_process is not None and bridge_process.poll() is None
-    cfg = load_config()
-    bots = []
-    for name, bot_cfg in cfg.get("bots", {}).items():
-        bots.append({
-            "name": name,
-            "profile": bot_cfg.get("feishu_profile", ""),
-            "app_id": bot_cfg.get("feishu_app_id", ""),
-            "model": bot_cfg.get("claude", {}).get("models", {}).get("default", ""),
-            "thinking_model": bot_cfg.get("claude", {}).get("models", {}).get("thinking", ""),
-        })
-    return {
-        "running": running,
-        "pid": bridge_process.pid if running else None,
-        "bot_count": len(bots),
-        "bots": bots,
-    }
-
-
-@app.get("/api/config")
-async def api_get_config():
-    return load_config()
-
-
-@app.post("/api/config/bots/{name}")
-async def api_add_bot(name: str, data: dict):
-    cfg = load_config()
-    if name in cfg.setdefault("bots", {}):
-        raise HTTPException(409, f"Bot '{name}' already exists")
-    cfg["bots"][name] = data
-    save_config(cfg)
-    broadcast_log(f"[GUI] Bot added: {name}")
-    return {"ok": True}
-
-
-@app.put("/api/config/bots/{name}")
-async def api_update_bot(name: str, data: dict):
-    cfg = load_config()
-    if name not in cfg.get("bots", {}):
-        raise HTTPException(404, f"Bot '{name}' not found")
-    cfg["bots"][name] = data
-    save_config(cfg)
-    broadcast_log(f"[GUI] Bot updated: {name}")
-    return {"ok": True}
-
-
-@app.delete("/api/config/bots/{name}")
-async def api_remove_bot(name: str):
-    cfg = load_config()
-    if name not in cfg.get("bots", {}):
-        raise HTTPException(404, f"Bot '{name}' not found")
-    del cfg["bots"][name]
-    save_config(cfg)
-    broadcast_log(f"[GUI] Bot removed: {name}")
-    return {"ok": True}
-
-
-@app.post("/api/bridge/start")
-async def api_start_bridge():
-    global bridge_process
-    if bridge_process and bridge_process.poll() is None:
-        return {"ok": False, "error": "Bridge is already running"}
-
-    broadcast_log("[GUI] Starting bridge...")
-
-    bridge_py = str(BRIDGE_DIR / "bridge.py")
-    try:
-        bridge_process = subprocess.Popen(
-            [sys.executable, "-u", bridge_py],
-            cwd=str(BRIDGE_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-        )
-    except Exception as e:
-        broadcast_log(f"[GUI] Failed to start bridge: {e}")
-        return {"ok": False, "error": str(e)}
-
-    # Background reader
-    def _read_bridge_output():
-        global bridge_process
-        for line in iter(bridge_process.stdout.readline, ""):
-            if line:
-                broadcast_log(line.rstrip())
-        broadcast_log("[GUI] Bridge process exited")
-        bridge_process = None
-
-    import threading
-    t = threading.Thread(target=_read_bridge_output, daemon=True)
-    t.start()
-
-    return {"ok": True, "pid": bridge_process.pid}
-
-
-@app.post("/api/bridge/stop")
-async def api_stop_bridge():
-    global bridge_process
-    if not bridge_process or bridge_process.poll() is not None:
-        return {"ok": False, "error": "Bridge is not running"}
-
-    broadcast_log("[GUI] Stopping bridge...")
-    bridge_process.terminate()
-    try:
-        bridge_process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        bridge_process.kill()
-        bridge_process.wait()
-    bridge_process = None
-    broadcast_log("[GUI] Bridge stopped")
-    return {"ok": True}
-
-
-@app.get("/api/profiles")
-async def api_list_profiles():
-    code, stdout, stderr = run_lark("profile", "list")
-    if code != 0:
-        return {"profiles": [], "error": stderr}
-    try:
-        profiles = json.loads(stdout)
-        return {"profiles": profiles}
-    except json.JSONDecodeError:
-        return {"profiles": [], "error": stdout}
-
-
-@app.delete("/api/profiles/{name}")
-async def api_remove_profile(name: str):
-    code, stdout, stderr = run_lark("profile", "remove", name)
-    if code != 0:
-        raise HTTPException(400, stderr or stdout)
-    return {"ok": True}
-
-
-@app.post("/api/profiles")
-async def api_add_profile(data: dict):
-    name = data.get("name", "")
-    app_id = data.get("app_id", "")
-    app_secret = data.get("app_secret", "")
-    brand = data.get("brand", "feishu")
-    if not name or not app_id or not app_secret:
-        raise HTTPException(400, "name, app_id, app_secret required")
-
-    r = subprocess.run(
-        [LARK_CLI, "profile", "add", "--name", name, "--app-id", app_id, "--brand", brand, "--use", "--app-secret-stdin"],
-        input=app_secret, capture_output=True, text=True, timeout=15,
-    )
-    if r.returncode != 0:
-        raise HTTPException(400, r.stderr or r.stdout)
-    return {"ok": True}
-
-
-@app.get("/api/event-status")
-async def api_event_status():
-    code, stdout, stderr = run_lark("event", "status")
-    return {"code": code, "output": stdout, "error": stderr}
-
-
-# ═══════════════════════════════════════════════════
-# WebSocket — live log streaming
-# ═══════════════════════════════════════════════════
-
-@app.websocket("/ws/logs")
-async def ws_logs(ws: WebSocket):
-    await ws.accept()
-    log_clients.append(ws)
-    # Send recent buffer
-    for entry in log_buffer[-100:]:
-        try:
-            await ws.send_text(entry)
-        except Exception:
-            break
-    try:
-        while True:
-            await ws.receive_text()  # keep-alive pings from client
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if ws in log_clients:
-            log_clients.remove(ws)
-
-
-# ═══════════════════════════════════════════════════
-# Dashboard HTML
-# ═══════════════════════════════════════════════════
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -338,7 +138,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .log-viewer .log-line { white-space:pre-wrap; word-break:break-all; }
   .modal-overlay { display:none; position:fixed; top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6); z-index:100; align-items:center; justify-content:center; }
   .modal-overlay.show { display:flex; }
-  .modal { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:24px; width:90%; max-width:560px; max-height:90vh; overflow-y:auto; }
+  .modal { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:24px; width:90%; max-width:640px; max-height:90vh; overflow-y:auto; }
   .modal h3 { margin-bottom:16px; }
   .toast { position:fixed; bottom:24px; right:24px; padding:10px 20px; border-radius:6px; font-size:0.85em; z-index:200; animation:fadein .3s; }
   .toast-ok { background:var(--green); color:#000; }
@@ -346,13 +146,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   @keyframes fadein { from{opacity:0;transform:translateY(10px);} to{opacity:1;transform:translateY(0);} }
   .empty { text-align:center; padding:40px; color:var(--text2); }
   .mask { font-family:monospace; color:var(--text2); }
+  .tag { display:inline-block; background:var(--border); color:var(--text); padding:2px 8px; border-radius:3px; font-size:0.75em; margin:1px 2px; }
+  .tag.green { background:#0d4d3a; color:var(--green); }
+  details { margin-top:8px; }
+  summary { cursor:pointer; color:var(--text2); font-size:0.85em; }
+  summary:hover { color:var(--text); }
+  .help-text { font-size:0.75em; color:var(--text2); margin-top:2px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:3px; font-size:0.7em; font-weight:bold; }
+  .badge-embedded { background:#0d4d3a; color:var(--green); }
 </style>
 </head>
 <body>
 
 <header>
-  <h1><span class="status-dot off" id="statusDot"></span>Claude-Feishu Bridge</h1>
-  <div>
+  <h1><span class="status-dot off" id="statusDot"></span>Claude-Feishu Bridge <span class="badge badge-embedded" id="badgeEmbedded" style="display:none">EMBEDDED</span></h1>
+  <div id="bridgeControls">
     <button class="btn btn-success btn-sm" onclick="startBridge()" id="btnStart">Start Bridge</button>
     <button class="btn btn-danger btn-sm" onclick="stopBridge()" id="btnStop" style="display:none">Stop Bridge</button>
   </div>
@@ -375,7 +183,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="card">
     <h3>Bot Overview</h3>
-    <table><thead><tr><th>Name</th><th>Profile</th><th>App ID</th><th>Default Model</th><th>Thinking Model</th></tr></thead>
+    <table><thead><tr><th>Name</th><th>Display</th><th>Profile</th><th>Model</th><th>Allowed Tools</th></tr></thead>
     <tbody id="botTable"></tbody></table>
     <div class="empty" id="botEmpty" style="display:none">No bots configured. Go to the Bots tab to add one.</div>
   </div>
@@ -417,26 +225,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <h3 id="botModalTitle">Add Bot</h3>
     <input type="hidden" id="botEditName">
     <div class="form-row">
-      <div class="form-group"><label>Bot Name</label><input id="bmName" placeholder="e.g. default"></div>
+      <div class="form-group"><label>Bot Key <span class="help-text">(unique identifier)</span></label><input id="bmName" placeholder="e.g. honglong"></div>
+      <div class="form-group"><label>Display Name <span class="help-text">(shown in chat)</span></label><input id="bmDisplay" placeholder="e.g. 红龙"></div>
+    </div>
+    <div class="form-row">
       <div class="form-group"><label>Feishu Profile</label><input id="bmProfile" placeholder="lark-cli profile name"></div>
+      <div class="form-group"><label>Reaction Emoji</label><input id="bmReaction" placeholder="Typing" value="Typing"></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label>Feishu App ID</label><input id="bmAppId" placeholder="cli_xxx"></div>
       <div class="form-group"><label>Feishu App Secret</label><input id="bmAppSecret" type="password" placeholder="App Secret"></div>
     </div>
-    <div class="form-row">
-      <div class="form-group"><label>API Key</label><input id="bmApiKey" placeholder="sk-xxx or tp-xxx"></div>
-      <div class="form-group"><label>Base URL</label><input id="bmBaseUrl" placeholder="https://..."></div>
-    </div>
-    <div class="form-row">
-      <div class="form-group"><label>Default Model</label><input id="bmModel" placeholder="mimo-v2.5"></div>
-      <div class="form-group"><label>Thinking Model</label><input id="bmThinkModel" placeholder="mimo-v2.5-pro"></div>
-      <div class="form-group"><label>Max Tokens</label><input id="bmMaxTokens" type="number" value="8192"></div>
-    </div>
-    <div class="form-row">
-      <div class="form-group"><label>System Prompt</label><textarea id="bmSysPrompt" rows="2" placeholder="你是一个通过飞书与用户交流的AI助手。回答简洁清晰。"></textarea></div>
-      <div class="form-group"><label>Max Context</label><input id="bmMaxCtx" type="number" value="20"></div>
-    </div>
+    <details>
+      <summary>Claude CLI Settings</summary>
+      <div class="form-row" style="margin-top:8px">
+        <div class="form-group"><label>Model <span class="help-text">(optional, env var takes precedence)</span></label><input id="bmModel" placeholder="default"></div>
+        <div class="form-group"><label>Permission Mode</label><select id="bmPermMode"><option value="auto">auto</option><option value="acceptEdits">acceptEdits</option><option value="default">default</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Max Turns</label><input id="bmMaxTurns" type="number" value="20"></div>
+        <div class="form-group"><label>Timeout (seconds)</label><input id="bmTimeout" type="number" value="120"></div>
+      </div>
+      <div class="form-group"><label>Allowed Tools</label><input id="bmTools" placeholder="Bash, Edit, Read, Write, Glob, Grep"></div>
+      <div class="form-group"><label>Add Dirs <span class="help-text">(comma-separated paths)</span></label><input id="bmDirs" placeholder="C:\Users\yourname\Desktop"></div>
+    </details>
+    <div class="form-group"><label>System Prompt</label><textarea id="bmSysPrompt" rows="4" placeholder="你是XX，一个通过飞书与用户交流的AI助手。"></textarea></div>
+    <div class="form-group"><label>Max Context Messages</label><input id="bmMaxCtx" type="number" value="20"></div>
     <div class="btn-group" style="justify-content:flex-end">
       <button class="btn btn-outline" onclick="closeBotModal()">Cancel</button>
       <button class="btn btn-primary" onclick="saveBot()">Save</button>
@@ -464,6 +278,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
+// ── Globals ──
+let EMBEDDED = false;
+
 // ── Navigation ──
 document.querySelectorAll('nav button').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -493,22 +310,27 @@ async function api(method, path, body) {
 }
 
 // ── Status polling ──
-let bridgeRunning = false;
 async function pollStatus() {
   try {
     const s = await api('GET', '/api/status');
-    bridgeRunning = s.running;
     document.getElementById('statusDot').className = 'status-dot ' + (s.running ? 'on' : 'off');
     document.getElementById('statBots').textContent = s.bot_count;
     document.getElementById('statStatus').textContent = s.running ? 'Running' : 'Stopped';
     document.getElementById('statPID').textContent = s.pid || '-';
-    document.getElementById('btnStart').style.display = s.running ? 'none' : '';
-    document.getElementById('btnStop').style.display = s.running ? '' : 'none';
 
-    // Bot table
+    if (EMBEDDED) {
+      document.getElementById('bridgeControls').style.display = 'none';
+      document.getElementById('badgeEmbedded').style.display = '';
+    } else {
+      document.getElementById('btnStart').style.display = s.running ? 'none' : '';
+      document.getElementById('btnStop').style.display = s.running ? '' : 'none';
+    }
+
     const tb = document.getElementById('botTable');
     const empty = document.getElementById('botEmpty');
-    tb.innerHTML = s.bots.map(b => `<tr><td><strong>${esc(b.name)}</strong></td><td>${esc(b.profile)}</td><td class="mask">${esc(b.app_id).slice(0,12)}...</td><td>${esc(b.model)}</td><td>${esc(b.thinking_model)}</td></tr>`).join('');
+    tb.innerHTML = s.bots.map(b =>
+      `<tr><td><strong>${esc(b.name)}</strong></td><td>${esc(b.display_name)}</td><td>${esc(b.profile)}</td><td>${esc(b.model)}</td><td>${(b.allowed_tools||[]).map(t=>'<span class="tag green">'+esc(t)+'</span>').join(' ')}</td></tr>`
+    ).join('');
     empty.style.display = s.bots.length ? 'none' : '';
   } catch(e) { console.error(e); }
 }
@@ -522,22 +344,29 @@ async function loadBots() {
     const empty = document.getElementById('botCardsEmpty');
     const entries = Object.entries(bots);
     container.innerHTML = entries.map(([name,b]) => {
+      const cli = b.claude_cli || {};
       const cc = b.claude || {};
+      const tools = (cli.allowed_tools||[]).map(t=>'<span class="tag green">'+esc(t)+'</span>').join(' ');
+      const dirs = (cli.add_dirs||[]).map(d=>'<span class="tag">'+esc(d)+'</span>').join(' ');
       return `<div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <h3 style="margin:0">${esc(name)} <span class="mask">(${esc(b.feishu_profile)} &rarr; ${esc(b.feishu_app_id||'').slice(0,12)}...)</span></h3>
+          <h3 style="margin:0">${esc(b.display_name||name)} <span class="mask">(${esc(name)})</span></h3>
           <div class="btn-group" style="margin:0">
             <button class="btn btn-outline btn-sm" onclick="editBot('${esc(name)}')">Edit</button>
             <button class="btn btn-danger btn-sm" onclick="deleteBot('${esc(name)}')">Delete</button>
           </div>
         </div>
         <div class="grid2" style="margin-top:12px">
-          <div><div class="label">Default Model</div>${esc(cc.models?.default||'-')}</div>
-          <div><div class="label">Thinking Model</div>${esc(cc.models?.thinking||'-')}</div>
-          <div><div class="label">Max Tokens</div>${cc.max_tokens||'-'}</div>
-          <div><div class="label">Max Context</div>${b.max_context_messages||'-'}</div>
+          <div><div class="label">Profile</div>${esc(b.feishu_profile||'-')}</div>
+          <div><div class="label">App ID</div><span class="mask">${esc((b.feishu_app_id||'').slice(0,14))}...</span></div>
+          <div><div class="label">Model</div>${esc(cli.model||'default')}</div>
+          <div><div class="label">Permission Mode</div>${esc(cli.permission_mode||'auto')}</div>
+          <div><div class="label">Max Turns / Timeout</div>${cli.max_turns||20} / ${cli.timeout_seconds||120}s</div>
+          <div><div class="label">Reaction</div>${esc(cli.reaction_emoji||'Typing')}</div>
         </div>
-        <div style="margin-top:8px"><div class="label">System Prompt</div><span style="font-size:0.85em;color:var(--text2)">${esc((cc.system_prompt||'').slice(0,120))}${(cc.system_prompt||'').length>120?'...':''}</span></div>
+        <div style="margin-top:8px"><div class="label">Allowed Tools</div>${tools||'<span class="mask">default</span>'}</div>
+        <div style="margin-top:4px"><div class="label">Add Dirs</div>${dirs||'<span class="mask">none</span>'}</div>
+        <div style="margin-top:8px"><div class="label">System Prompt</div><span style="font-size:0.85em;color:var(--text2)">${esc((cc.system_prompt||'').slice(0,150))}${(cc.system_prompt||'').length>150?'...':''}</span></div>
       </div>`;
     }).join('');
     empty.style.display = entries.length ? 'none' : '';
@@ -552,22 +381,29 @@ function showBotModal(name) {
     api('GET','/api/config').then(cfg => {
       const b = (cfg.bots||{})[name];
       if (!b) return;
+      const cli = b.claude_cli || {};
       const cc = b.claude || {};
       document.getElementById('bmName').value = name;
+      document.getElementById('bmDisplay').value = b.display_name || '';
       document.getElementById('bmProfile').value = b.feishu_profile || '';
+      document.getElementById('bmReaction').value = cli.reaction_emoji || 'Typing';
       document.getElementById('bmAppId').value = b.feishu_app_id || '';
       document.getElementById('bmAppSecret').value = b.feishu_app_secret || '';
-      document.getElementById('bmApiKey').value = cc.api_key || '';
-      document.getElementById('bmBaseUrl').value = cc.base_url || '';
-      document.getElementById('bmModel').value = cc.models?.default || '';
-      document.getElementById('bmThinkModel').value = cc.models?.thinking || '';
-      document.getElementById('bmMaxTokens').value = cc.max_tokens || 8192;
+      document.getElementById('bmModel').value = cli.model || '';
+      document.getElementById('bmPermMode').value = cli.permission_mode || 'auto';
+      document.getElementById('bmMaxTurns').value = cli.max_turns || 20;
+      document.getElementById('bmTimeout').value = cli.timeout_seconds || 120;
+      document.getElementById('bmTools').value = (cli.allowed_tools||[]).join(', ');
+      document.getElementById('bmDirs').value = (cli.add_dirs||[]).join(', ');
       document.getElementById('bmSysPrompt').value = cc.system_prompt || '';
       document.getElementById('bmMaxCtx').value = b.max_context_messages || 20;
     });
   } else {
-    ['bmName','bmProfile','bmAppId','bmAppSecret','bmApiKey','bmBaseUrl','bmModel','bmThinkModel','bmSysPrompt'].forEach(id => document.getElementById(id).value = '');
-    document.getElementById('bmMaxTokens').value = 8192;
+    ['bmName','bmDisplay','bmProfile','bmAppId','bmAppSecret','bmModel','bmTools','bmDirs','bmSysPrompt'].forEach(id => document.getElementById(id).value = '');
+    document.getElementById('bmReaction').value = 'Typing';
+    document.getElementById('bmPermMode').value = 'auto';
+    document.getElementById('bmMaxTurns').value = 20;
+    document.getElementById('bmTimeout').value = 120;
     document.getElementById('bmMaxCtx').value = 20;
   }
 }
@@ -577,28 +413,37 @@ function closeBotModal() { document.getElementById('botModalOverlay').classList.
 async function saveBot() {
   const editName = document.getElementById('botEditName').value;
   const name = document.getElementById('bmName').value.trim();
-  if (!name) { toast('Bot name is required', false); return; }
+  if (!name) { toast('Bot key is required', false); return; }
+
+  const toolsRaw = document.getElementById('bmTools').value.trim();
+  const dirsRaw = document.getElementById('bmDirs').value.trim();
+
   const bot = {
+    display_name: document.getElementById('bmDisplay').value.trim(),
     feishu_profile: document.getElementById('bmProfile').value.trim(),
     feishu_app_id: document.getElementById('bmAppId').value.trim(),
     feishu_app_secret: document.getElementById('bmAppSecret').value.trim(),
     claude: {
-      api_key: document.getElementById('bmApiKey').value.trim(),
-      base_url: document.getElementById('bmBaseUrl').value.trim(),
-      models: {
-        default: document.getElementById('bmModel').value.trim(),
-        thinking: document.getElementById('bmThinkModel').value.trim()
-      },
-      max_tokens: parseInt(document.getElementById('bmMaxTokens').value) || 8192,
       system_prompt: document.getElementById('bmSysPrompt').value.trim()
+    },
+    claude_cli: {
+      model: document.getElementById('bmModel').value.trim() || undefined,
+      permission_mode: document.getElementById('bmPermMode').value,
+      allowed_tools: toolsRaw ? toolsRaw.split(',').map(s=>s.trim()).filter(Boolean) : [],
+      add_dirs: dirsRaw ? dirsRaw.split(',').map(s=>s.trim()).filter(Boolean) : [],
+      max_turns: parseInt(document.getElementById('bmMaxTurns').value) || 20,
+      timeout_seconds: parseInt(document.getElementById('bmTimeout').value) || 120,
+      reaction_emoji: document.getElementById('bmReaction').value.trim() || 'Typing'
     },
     max_context_messages: parseInt(document.getElementById('bmMaxCtx').value) || 20
   };
+
+  if (!bot.claude_cli.model) delete bot.claude_cli.model;
+
   try {
     if (editName) {
       await api('PUT', '/api/config/bots/' + editName, bot);
       if (name !== editName) {
-        // Rename: delete old + add new
         await api('DELETE', '/api/config/bots/' + editName);
         await api('POST', '/api/config/bots/' + name, bot);
       }
@@ -674,7 +519,6 @@ function connectLogs() {
     div.textContent = e.data;
     viewer.appendChild(div);
     if (atBottom) viewer.scrollTop = viewer.scrollHeight;
-    // Keep max 1000 lines in DOM
     while (viewer.children.length > 1000) viewer.firstChild.remove();
   };
   logSocket.onclose = () => { setTimeout(connectLogs, 3000); };
@@ -704,18 +548,218 @@ async function stopBridge() {
 function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 // ── Init ──
-pollStatus();
-loadBots();
-loadProfiles();
-connectLogs();
-setInterval(pollStatus, 5000);
+async function init() {
+  try {
+    const meta = await api('GET', '/api/meta');
+    EMBEDDED = meta.embedded;
+  } catch(e) { /* pre-embedded GUI, ignore */ }
+  pollStatus();
+  loadBots();
+  loadProfiles();
+  connectLogs();
+  setInterval(pollStatus, 5000);
+}
+init();
 </script>
 </body>
 </html>"""
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    return DASHBOARD_HTML
+
+def create_app(embedded: bool = False):
+    """Create and configure the FastAPI app. Set embedded=True when running inside bridge.py."""
+
+    app = FastAPI(title="Claude-Feishu Bridge", version="3.0")
+
+    # ═══════════════════════════════════════════════════
+    # REST API
+    # ═══════════════════════════════════════════════════
+
+    @app.get("/api/meta")
+    async def api_meta():
+        return {"embedded": embedded}
+
+    @app.get("/api/status")
+    async def api_status():
+        global bridge_process
+        running = bridge_process is not None and bridge_process.poll() is None
+        cfg = load_config()
+        bots = []
+        for name, bot_cfg in cfg.get("bots", {}).items():
+            cli = bot_cfg.get("claude_cli", {})
+            bots.append({
+                "name": name,
+                "display_name": bot_cfg.get("display_name", name),
+                "profile": bot_cfg.get("feishu_profile", ""),
+                "app_id": bot_cfg.get("feishu_app_id", ""),
+                "model": cli.get("model", "default"),
+                "allowed_tools": cli.get("allowed_tools", []),
+            })
+        return {
+            "running": running,
+            "pid": bridge_process.pid if running else None,
+            "bot_count": len(bots),
+            "bots": bots,
+        }
+
+    @app.get("/api/config")
+    async def api_get_config():
+        return load_config()
+
+    @app.post("/api/config/bots/{name}")
+    async def api_add_bot(name: str, data: dict):
+        cfg = load_config()
+        if name in cfg.setdefault("bots", {}):
+            raise HTTPException(409, f"Bot '{name}' already exists")
+        cfg["bots"][name] = data
+        save_config(cfg)
+        broadcast_log(f"[GUI] Bot added: {name}")
+        return {"ok": True}
+
+    @app.put("/api/config/bots/{name}")
+    async def api_update_bot(name: str, data: dict):
+        cfg = load_config()
+        if name not in cfg.get("bots", {}):
+            raise HTTPException(404, f"Bot '{name}' not found")
+        cfg["bots"][name] = data
+        save_config(cfg)
+        broadcast_log(f"[GUI] Bot updated: {name}")
+        return {"ok": True}
+
+    @app.delete("/api/config/bots/{name}")
+    async def api_remove_bot(name: str):
+        cfg = load_config()
+        if name not in cfg.get("bots", {}):
+            raise HTTPException(404, f"Bot '{name}' not found")
+        del cfg["bots"][name]
+        save_config(cfg)
+        broadcast_log(f"[GUI] Bot removed: {name}")
+        return {"ok": True}
+
+    @app.post("/api/bridge/start")
+    async def api_start_bridge():
+        global bridge_process
+
+        if embedded:
+            return {"ok": False, "error": "Bridge is running in-process (--gui mode). Use the terminal to manage it."}
+
+        if bridge_process and bridge_process.poll() is None:
+            return {"ok": False, "error": "Bridge is already running"}
+
+        broadcast_log("[GUI] Starting bridge...")
+
+        bridge_py = str(BRIDGE_DIR / "bridge.py")
+        try:
+            bridge_process = subprocess.Popen(
+                [sys.executable, "-u", bridge_py],
+                cwd=str(BRIDGE_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+        except Exception as e:
+            broadcast_log(f"[GUI] Failed to start bridge: {e}")
+            return {"ok": False, "error": str(e)}
+
+        import threading
+        def _read_bridge_output():
+            global bridge_process
+            for line in iter(bridge_process.stdout.readline, ""):
+                if line:
+                    broadcast_log(line.rstrip())
+            broadcast_log("[GUI] Bridge process exited")
+            bridge_process = None
+
+        t = threading.Thread(target=_read_bridge_output, daemon=True)
+        t.start()
+
+        return {"ok": True, "pid": bridge_process.pid}
+
+    @app.post("/api/bridge/stop")
+    async def api_stop_bridge():
+        global bridge_process
+
+        if embedded:
+            return {"ok": False, "error": "Bridge is running in-process (--gui mode). Use Ctrl+C in the terminal."}
+
+        if not bridge_process or bridge_process.poll() is not None:
+            return {"ok": False, "error": "Bridge is not running"}
+
+        broadcast_log("[GUI] Stopping bridge...")
+        bridge_process.terminate()
+        try:
+            bridge_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            bridge_process.kill()
+            bridge_process.wait()
+        bridge_process = None
+        broadcast_log("[GUI] Bridge stopped")
+        return {"ok": True}
+
+    @app.get("/api/profiles")
+    async def api_list_profiles():
+        code, stdout, stderr = run_lark("profile", "list")
+        if code != 0:
+            return {"profiles": [], "error": stderr}
+        try:
+            profiles = json.loads(stdout)
+            return {"profiles": profiles}
+        except json.JSONDecodeError:
+            return {"profiles": [], "error": stdout}
+
+    @app.delete("/api/profiles/{name}")
+    async def api_remove_profile(name: str):
+        code, stdout, stderr = run_lark("profile", "remove", name)
+        if code != 0:
+            raise HTTPException(400, stderr or stdout)
+        return {"ok": True}
+
+    @app.post("/api/profiles")
+    async def api_add_profile(data: dict):
+        name = data.get("name", "")
+        app_id = data.get("app_id", "")
+        app_secret = data.get("app_secret", "")
+        brand = data.get("brand", "feishu")
+        if not name or not app_id or not app_secret:
+            raise HTTPException(400, "name, app_id, app_secret required")
+
+        r = subprocess.run(
+            [LARK_CLI, "profile", "add", "--name", name, "--app-id", app_id, "--brand", brand, "--use", "--app-secret-stdin"],
+            input=app_secret, capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            raise HTTPException(400, r.stderr or r.stdout)
+        return {"ok": True}
+
+    # ═══════════════════════════════════════════════════
+    # WebSocket — live log streaming
+    # ═══════════════════════════════════════════════════
+
+    @app.websocket("/ws/logs")
+    async def ws_logs(ws: WebSocket):
+        await ws.accept()
+        log_clients.append(ws)
+        for entry in log_buffer[-100:]:
+            try:
+                await ws.send_text(entry)
+            except Exception:
+                break
+        try:
+            while True:
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if ws in log_clients:
+                log_clients.remove(ws)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard():
+        return DASHBOARD_HTML
+
+    return app
 
 
 def main():
@@ -732,6 +776,7 @@ def main():
     print(f" Dashboard: http://{args.host}:{args.port}")
     print(f" Bridge dir: {BRIDGE_DIR}")
 
+    app = create_app(embedded=False)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

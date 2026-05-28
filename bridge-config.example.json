@@ -15,7 +15,8 @@
         "allowed_tools": ["Bash", "Edit", "Read", "Write", "Glob", "Grep"],
         "add_dirs": ["C:\\Users\\yourname\\Desktop"],
         "max_turns": 20,
-        "timeout_seconds": 120
+        "timeout_seconds": 120,
+        "reaction_emoji": "Typing"
       },
       "max_context_messages": 20
     }

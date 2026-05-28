@@ -5,7 +5,9 @@
 ## 架构
 
 ```
-bridge.py
+bridge.py [--gui]
+├─ Web Dashboard (FastAPI + WebSocket)  ← --gui 模式
+│   └─ http://127.0.0.1:8080
 ├─ BotRunner "honglong" (红龙)     BotRunner "xiaohong" (小红)
 │   ├─ lark-cli event consume      ├─ lark-cli event consume
 │   │   └─ WebSocket ─ 飞书事件     │   └─ WebSocket ─ 飞书事件
@@ -19,11 +21,12 @@ bridge.py
 
 ## 依赖
 
-| 类型 | 名称 | 安装 |
-|---|---|---|
-| Python | httpx | `pip install httpx` |
-| CLI | Claude Code | [官方安装](https://docs.anthropic.com/en/docs/claude-code) |
-| CLI | lark-cli | `npm install -g @larksuite/cli` |
+| 类型 | 名称 | 用途 | 安装 |
+|---|---|---|---|
+| Python | httpx | 飞书 REST API 客户端 | `pip install httpx` |
+| Python | fastapi, uvicorn | Web 管理面板（`--gui` 模式） | `pip install fastapi uvicorn` |
+| CLI | Claude Code | AI 引擎 | [官方安装](https://docs.anthropic.com/en/docs/claude-code) |
+| CLI | lark-cli | 飞书事件订阅 | `npm install -g @larksuite/cli` |
 
 ## 快速开始
 
@@ -84,7 +87,11 @@ cp bridge-config.example.json bridge-config.json
 ### 4. 启动
 
 ```bash
+# 仅运行桥接
 python bridge.py
+
+# 桥接 + Web 管理面板（http://127.0.0.1:8080）
+python bridge.py --gui
 ```
 
 看到 `[honglong] ready event_key=im.message.receive_v1` 即表示连接成功。

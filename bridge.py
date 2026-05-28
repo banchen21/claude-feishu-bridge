@@ -2,6 +2,7 @@
 Claude <-> Feishu Bridge — Multi-Bot Edition
 Each bot runs independently via @larksuite/cli event daemon + Claude Code CLI.
 """
+import argparse
 import json
 import os
 import shutil
@@ -15,8 +16,8 @@ from pathlib import Path
 
 if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+    _orig_stdout = sys.stdout
+    sys.stdout = io.TextIOWrapper(_orig_stdout.buffer, encoding='utf-8', line_buffering=True)
 
 import httpx
 
@@ -439,9 +440,10 @@ class BotRunner:
 # ===========================================================================
 
 class Bridge:
-    def __init__(self):
+    def __init__(self, gui_server=None):
         cfg = load_config()
         self.bots: list[BotRunner] = []
+        self.gui_server = gui_server
         for name, bot_cfg in cfg["bots"].items():
             self.bots.append(BotRunner(name, bot_cfg))
 
@@ -472,7 +474,10 @@ class Bridge:
                 if s.name != bot.name and s._bot_open_id
             ]
 
-        tasks = [asyncio.create_task(bot.run()) for bot in self.bots]
+        tasks = []
+        if self.gui_server:
+            tasks.append(asyncio.create_task(self.gui_server.serve()))
+        tasks += [asyncio.create_task(bot.run()) for bot in self.bots]
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
@@ -488,6 +493,12 @@ class Bridge:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Claude <-> Feishu Bridge")
+    parser.add_argument("--gui", action="store_true", help="Start web dashboard alongside the bridge")
+    parser.add_argument("--port", type=int, default=8080, help="GUI port (default: 8080)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="GUI bind address (default: 127.0.0.1)")
+    args = parser.parse_args()
+
     if not CONFIG_PATH.exists():
         print(f"Config not found: {CONFIG_PATH}")
         sys.exit(1)
@@ -499,7 +510,20 @@ def main():
 
     CLI_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-    bridge = Bridge()
+    gui_server = None
+    if args.gui:
+        from importlib.machinery import SourceFileLoader
+        import uvicorn
+
+        gui_path = str(DATA_DIR / "bridge-gui.py")
+        gui_module = SourceFileLoader("bridge_gui", gui_path).load_module()
+        gui_app = gui_module.create_app(embedded=True)
+
+        config = uvicorn.Config(gui_app, host=args.host, port=args.port, log_level="info")
+        gui_server = uvicorn.Server(config)
+        print(f"[Bridge] GUI dashboard: http://{args.host}:{args.port}")
+
+    bridge = Bridge(gui_server=gui_server)
     try:
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
