@@ -1,0 +1,10 @@
+# Sensitive config with real credentials
+bridge-config.json
+
+# Runtime session data
+bridge-sessions-*.json
+bridge-last-msg-*.json
+
+# Python
+__pycache__/
+*.pyc
