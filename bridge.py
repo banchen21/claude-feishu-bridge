@@ -225,6 +225,23 @@ class BotRunner:
             print(f"[{self.name}] mentions API failed: {e}")
             return set()
 
+    def _resolve_sender(self, sender_id: str) -> str:
+        """Resolve sender_id to a display name. Returns empty string for unknown users."""
+        if not sender_id:
+            return ""
+        for s in self._siblings:
+            if s["open_id"] == sender_id:
+                return s["display_name"]
+        return ""  # unknown user — don't label
+
+    def _replace_at_tags(self, text: str) -> str:
+        """Replace @display_name mentions with proper Feishu <at> tags."""
+        for s in self._siblings:
+            name = s["display_name"]
+            at_tag = f'<at user_id="{s["open_id"]}">{name}</at>'
+            text = text.replace(f"@{name}", at_tag)
+        return text
+
     # ── Claude ──
 
     def _call_claude_sync(self, session_key: str, user_msg: str) -> str:
@@ -241,19 +258,10 @@ class BotRunner:
         model = self.models["thinking"] if any(k in user_msg.lower() for k in think_kw) else self.models["default"]
 
         try:
-            # Build full system prompt with sibling bot at-tags
-            sibling_info = ""
-            if self._siblings:
-                parts = ["\n\n## 如何在回复中@其他机器人"]
-                parts.append("飞书文本消息中，使用 `<at user_id=\"open_id\">名字</at>` 格式可以触发真正的@通知。以下是群内其他机器人的信息：")
-                for s in self._siblings:
-                    parts.append(f"- {s['display_name']}: `<at user_id=\"{s['open_id']}\">{s['display_name']}</at>`")
-                sibling_info = "\n".join(parts)
-
             resp = self.claude.messages.create(
                 model=model,
                 max_tokens=self.max_tokens,
-                system=f"你的名字叫{self.display_name}。{self.system_prompt}{sibling_info}",
+                system=f"你的名字叫{self.display_name}。{self.system_prompt}",
                 messages=messages,
             )
             text = "".join(b.text for b in resp.content if b.type == "text")
@@ -307,8 +315,14 @@ class BotRunner:
 
         print(f"[{self.name}] {chat_type}:{chat_id[:12]}... | {content[:80]}")
 
+        # Enrich message with sender context
+        sender_name = self._resolve_sender(sender_id)
+        if sender_name:
+            content = f"[发送者: {sender_name}] {content}"
+
         session_key = f"{chat_type}:{chat_id}"
         reply = await self._call_claude_async(session_key, content)
+        reply = self._replace_at_tags(reply)
 
         for i in range(0, len(reply), 7000):
             await self._reply_text(message_id, reply[i:i + 7000])
