@@ -134,4 +134,10 @@ MIT
 
 ---
 
-Powered by [73info.cn](https://73info.cn) — 技术资讯与工具导航
+<div align="center">
+
+🌐 **[73Info 柒叁信息](https://73info.cn)** — 开发者资源发现 · 需求对接 · 定制协作平台
+
+*需要 AI 开发？来 73Info 找到靠谱的开发者。*
+
+</div>
