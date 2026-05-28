@@ -572,7 +572,9 @@ def main():
         gui_module = SourceFileLoader("bridge_gui", gui_path).load_module()
         gui_app = gui_module.create_app(embedded=True)
 
-        config = uvicorn.Config(gui_app, host=args.host, port=args.port, log_level="info")
+        gui_module.install_log_tee()
+
+        config = uvicorn.Config(gui_app, host=args.host, port=args.port, log_level="warning")
         gui_server = uvicorn.Server(config)
         print(f"[Bridge] GUI dashboard: http://{args.host}:{args.port}")
 

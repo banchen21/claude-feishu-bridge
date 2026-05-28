@@ -79,6 +79,38 @@ def broadcast_log(line: str):
         log_clients.remove(ws)
 
 
+class LogTee:
+    """Wraps a file-like object, broadcasting each line written to it."""
+
+    def __init__(self, original):
+        self.original = original
+        self._buf = ""
+
+    def write(self, s: str):
+        self.original.write(s)
+        self.original.flush()
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip("\r")
+            if line:
+                broadcast_log(line)
+
+    def flush(self):
+        self.original.flush()
+
+    def isatty(self):
+        return getattr(self.original, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self.original.fileno()
+
+
+def install_log_tee():
+    """Replace sys.stdout with a LogTee so all bridge output appears in GUI logs."""
+    sys.stdout = LogTee(sys.stdout)
+
+
 def run_lark(*args) -> tuple[int, str, str]:
     try:
         r = subprocess.run(
@@ -584,7 +616,12 @@ def create_app(embedded: bool = False):
     @app.get("/api/status")
     async def api_status():
         global bridge_process
-        running = bridge_process is not None and bridge_process.poll() is None
+        if embedded:
+            running = True
+            pid = os.getpid()
+        else:
+            running = bridge_process is not None and bridge_process.poll() is None
+            pid = bridge_process.pid if running else None
         cfg = load_config()
         bots = []
         for name, bot_cfg in cfg.get("bots", {}).items():
@@ -599,7 +636,7 @@ def create_app(embedded: bool = False):
             })
         return {
             "running": running,
-            "pid": bridge_process.pid if running else None,
+            "pid": pid,
             "bot_count": len(bots),
             "bots": bots,
         }
