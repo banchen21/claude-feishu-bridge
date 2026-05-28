@@ -141,6 +141,7 @@ class BotRunner:
         self._token_expire: float = 0
         self._bot_open_id: str | None = None
         self._all_bot_ids: set[str] = set()  # set by Bridge after all bots resolve identity
+        self._siblings: list[dict] = []  # other bots: [{display_name, open_id}]
 
     # ── Feishu REST ──
 
@@ -240,10 +241,19 @@ class BotRunner:
         model = self.models["thinking"] if any(k in user_msg.lower() for k in think_kw) else self.models["default"]
 
         try:
+            # Build full system prompt with sibling bot at-tags
+            sibling_info = ""
+            if self._siblings:
+                parts = ["\n\n## 如何在回复中@其他机器人"]
+                parts.append("飞书文本消息中，使用 `<at user_id=\"open_id\">名字</at>` 格式可以触发真正的@通知。以下是群内其他机器人的信息：")
+                for s in self._siblings:
+                    parts.append(f"- {s['display_name']}: `<at user_id=\"{s['open_id']}\">{s['display_name']}</at>`")
+                sibling_info = "\n".join(parts)
+
             resp = self.claude.messages.create(
                 model=model,
                 max_tokens=self.max_tokens,
-                system=f"你的名字叫{self.display_name}。{self.system_prompt}",
+                system=f"你的名字叫{self.display_name}。{self.system_prompt}{sibling_info}",
                 messages=messages,
             )
             text = "".join(b.text for b in resp.content if b.type == "text")
@@ -396,6 +406,13 @@ class Bridge:
                 print(f"  [{bot.name}] WARN: cannot resolve identity: {e}")
         for bot in self.bots:
             bot._all_bot_ids = all_ids
+        # Set sibling info for each bot (for @mention in replies)
+        for bot in self.bots:
+            bot._siblings = [
+                {"display_name": s.display_name, "open_id": s._bot_open_id}
+                for s in self.bots
+                if s.name != bot.name and s._bot_open_id
+            ]
 
         tasks = [asyncio.create_task(bot.run()) for bot in self.bots]
         try:
