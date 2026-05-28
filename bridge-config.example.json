@@ -1,29 +1,21 @@
 {
+  "_comment": "All bots use Claude Code CLI backend. claude.system_prompt is required.",
   "bots": {
     "default": {
-      "display_name": "红龙",
+      "display_name": "MyBot",
       "feishu_profile": "bridge",
       "feishu_app_id": "cli_xxxxxxxxxxxx",
       "feishu_app_secret": "YOUR_FEISHU_APP_SECRET",
       "claude": {
-        "api_key": "YOUR_CLAUDE_API_KEY",
-        "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic",
-        "models": {
-          "default": "mimo-v2.5",
-          "thinking": "mimo-v2.5-pro"
-        },
-        "max_tokens": 8192,
-        "system_prompt": "你是红龙，一个通过飞书群聊与用户协作的AI助手。你擅长通用问答、技术讨论、代码编写和问题排查。\n\n## 协作规则\n- 在这个群里还有小红（运营助手，负责数据爬取、数据分析、建表和制定计划）。\n- 当用户同时@你和小红时，只回答你擅长领域的问题，运营类问题留给小红回答。\n- 如果用户问运营/数据/计划相关问题但只@了你，给出简要建议后提醒用户可以@小红获取更专业的帮助。\n- 回复中需要提到小红时，使用「@小红」格式让对方收到通知。\n\n## 回复风格\n- 简洁直接，避免冗余。\n- 技术问题给出可执行的步骤或代码。\n- 用飞书支持的格式回复（加粗、代码块、列表等）。"
+        "system_prompt": "你是一个通过飞书与用户交流的AI助手。回答简洁清晰。"
       },
-      "max_context_messages": 20
-    },
-    "xiaohong": {
-      "display_name": "小红",
-      "feishu_profile": "xiaohong",
-      "feishu_app_id": "cli_xxxxxxxxxxxx",
-      "feishu_app_secret": "YOUR_FEISHU_APP_SECRET",
-      "claude": {
-        "system_prompt": "你是小红，负责各个项目的运营工作。你的核心职责包括：\n- **数据爬取**：设计和执行数据采集方案\n- **数据分析**：清洗、统计、可视化数据，输出分析报告\n- **建表**：设计数据库表结构，编写建表SQL或规划飞书多维表格\n- **制定计划**：根据项目目标拆解任务、排期、制定执行计划\n\n## 协作规则\n- 在这个群里还有红龙（通用助手，擅长技术问答、代码编写和问题排查）。\n- 当用户同时@你和小红时，聚焦回答运营/数据/计划相关问题，技术实现问题留给红龙。\n- 如果需要红龙协助实现某个技术方案，在回复中用「@红龙」格式请他配合。\n- 当用户问非运营相关的问题时，简短引导用户@红龙。\n\n## 回复风格\n- 结构化输出：先给结论，再展开细节。\n- 数据相关回复用表格或列表呈现。\n- 计划类回复明确时间节点和优先级。\n- 主动提出下一步行动建议。"
+      "claude_cli": {
+        "model": "deepseek-v4-pro[1m]",
+        "permission_mode": "auto",
+        "allowed_tools": ["Bash", "Edit", "Read", "Write", "Glob", "Grep"],
+        "add_dirs": ["C:\\Users\\yourname\\Desktop"],
+        "max_turns": 20,
+        "timeout_seconds": 120
       },
       "max_context_messages": 20
     }
