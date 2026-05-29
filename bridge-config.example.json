@@ -3,7 +3,6 @@
   "bots": {
     "default": {
       "display_name": "MyBot",
-      "feishu_profile": "bridge",
       "feishu_app_id": "cli_xxxxxxxxxxxx",
       "feishu_app_secret": "YOUR_FEISHU_APP_SECRET",
       "claude": {

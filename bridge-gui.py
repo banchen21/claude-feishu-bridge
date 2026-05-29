@@ -40,6 +40,22 @@ if not _LARK_CLI:
             break
 LARK_CLI = _LARK_CLI or "lark-cli"
 
+
+def _kill_process(pid: int):
+    """Kill a process tree. On Windows, TerminateProcess leaves orphans;
+    taskkill /T ensures all descendants are cleaned up."""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, timeout=10,
+        )
+    else:
+        import signal
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
 # ── Global state ──
 bridge_process: subprocess.Popen | None = None
 log_clients: list[WebSocket] = []
@@ -111,11 +127,18 @@ def install_log_tee():
     sys.stdout = LogTee(sys.stdout)
 
 
+def _lark_env() -> dict:
+    env = os.environ.copy()
+    env["USERPROFILE"] = str(BRIDGE_DIR)
+    return env
+
+
 def run_lark(*args) -> tuple[int, str, str]:
     try:
         r = subprocess.run(
             [LARK_CLI, *args],
             capture_output=True, text=True, timeout=15,
+            env=_lark_env(),
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception as e:
@@ -218,7 +241,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="card">
     <h3>Bot Overview</h3>
-    <table><thead><tr><th>Name</th><th>Display</th><th>Profile</th><th>Model</th><th>Allowed Tools</th></tr></thead>
+    <table><thead><tr><th>Name</th><th>Display</th><th>Model</th><th>Allowed Tools</th></tr></thead>
     <tbody id="botTable"></tbody></table>
     <div class="empty" id="botEmpty" style="display:none">No bots configured. Go to the Bots tab to add one.</div>
   </div>
@@ -264,7 +287,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="form-group"><label>Display Name <span class="help-text">(shown in chat)</span></label><input id="bmDisplay" placeholder="e.g. 红龙"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label>Feishu Profile</label><input id="bmProfile" placeholder="lark-cli profile name"></div>
       <div class="form-group"><label>Reaction Emoji</label><input id="bmReaction" placeholder="Typing" value="Typing"></div>
     </div>
     <div class="form-row">
@@ -364,7 +386,7 @@ async function pollStatus() {
     const tb = document.getElementById('botTable');
     const empty = document.getElementById('botEmpty');
     tb.innerHTML = s.bots.map(b =>
-      `<tr><td><strong>${esc(b.name)}</strong></td><td>${esc(b.display_name)}</td><td>${esc(b.profile)}</td><td>${esc(b.model)}</td><td>${(b.allowed_tools||[]).map(t=>'<span class="tag green">'+esc(t)+'</span>').join(' ')}</td></tr>`
+      `<tr><td><strong>${esc(b.name)}</strong></td><td>${esc(b.display_name)}</td><td>${esc(b.model)}</td><td>${(b.allowed_tools||[]).map(t=>'<span class="tag green">'+esc(t)+'</span>').join(' ')}</td></tr>`
     ).join('');
     empty.style.display = s.bots.length ? 'none' : '';
   } catch(e) { console.error(e); }
@@ -392,7 +414,7 @@ async function loadBots() {
           </div>
         </div>
         <div class="grid2" style="margin-top:12px">
-          <div><div class="label">Profile</div>${esc(b.feishu_profile||'-')}</div>
+          <div><div class="label">Profile</div>${esc(name)} <span class="help-text">(auto-matched)</span></div>
           <div><div class="label">App ID</div><span class="mask">${esc((b.feishu_app_id||'').slice(0,14))}...</span></div>
           <div><div class="label">Model</div>${esc(cli.model||'default')}</div>
           <div><div class="label">Permission Mode</div>${esc(cli.permission_mode||'auto')}</div>
@@ -420,7 +442,6 @@ function showBotModal(name) {
       const cc = b.claude || {};
       document.getElementById('bmName').value = name;
       document.getElementById('bmDisplay').value = b.display_name || '';
-      document.getElementById('bmProfile').value = b.feishu_profile || '';
       document.getElementById('bmReaction').value = cli.reaction_emoji || 'Typing';
       document.getElementById('bmAppId').value = b.feishu_app_id || '';
       document.getElementById('bmAppSecret').value = b.feishu_app_secret || '';
@@ -434,7 +455,7 @@ function showBotModal(name) {
       document.getElementById('bmMaxCtx').value = b.max_context_messages || 20;
     });
   } else {
-    ['bmName','bmDisplay','bmProfile','bmAppId','bmAppSecret','bmModel','bmTools','bmDirs','bmSysPrompt'].forEach(id => document.getElementById(id).value = '');
+    ['bmName','bmDisplay','bmAppId','bmAppSecret','bmModel','bmTools','bmDirs','bmSysPrompt'].forEach(id => document.getElementById(id).value = '');
     document.getElementById('bmReaction').value = 'Typing';
     document.getElementById('bmPermMode').value = 'auto';
     document.getElementById('bmMaxTurns').value = 20;
@@ -455,7 +476,6 @@ async function saveBot() {
 
   const bot = {
     display_name: document.getElementById('bmDisplay').value.trim(),
-    feishu_profile: document.getElementById('bmProfile').value.trim(),
     feishu_app_id: document.getElementById('bmAppId').value.trim(),
     feishu_app_secret: document.getElementById('bmAppSecret').value.trim(),
     claude: {
@@ -629,7 +649,6 @@ def create_app(embedded: bool = False):
             bots.append({
                 "name": name,
                 "display_name": bot_cfg.get("display_name", name),
-                "profile": bot_cfg.get("feishu_profile", ""),
                 "app_id": bot_cfg.get("feishu_app_id", ""),
                 "model": cli.get("model", "default"),
                 "allowed_tools": cli.get("allowed_tools", []),
@@ -728,12 +747,18 @@ def create_app(embedded: bool = False):
             return {"ok": False, "error": "Bridge is not running"}
 
         broadcast_log("[GUI] Stopping bridge...")
+        pid = bridge_process.pid
         bridge_process.terminate()
         try:
             bridge_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             bridge_process.kill()
-            bridge_process.wait()
+            try:
+                bridge_process.wait(timeout=5)
+            except Exception:
+                pass
+        if pid:
+            _kill_process(pid)
         bridge_process = None
         broadcast_log("[GUI] Bridge stopped")
         return {"ok": True}
@@ -768,6 +793,7 @@ def create_app(embedded: bool = False):
         r = subprocess.run(
             [LARK_CLI, "profile", "add", "--name", name, "--app-id", app_id, "--brand", brand, "--use", "--app-secret-stdin"],
             input=app_secret, capture_output=True, text=True, timeout=15,
+            env=_lark_env(),
         )
         if r.returncode != 0:
             raise HTTPException(400, r.stderr or r.stdout)

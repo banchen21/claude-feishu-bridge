@@ -10,6 +10,15 @@ __pycache__/
 *.pyc
 .claude/
 
+# lark-cli project-scoped profiles (isolated via OPENCLAW_HOME)
+.lark-cli/
+
+# Stray AppData from USERPROFILE override (node.exe creates this)
+AppData/
+
+# Downloaded media cache
+.bridge-media/
+
 # PyInstaller
 build/
 dist/

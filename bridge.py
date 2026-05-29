@@ -1,6 +1,6 @@
 """
 Claude <-> Feishu Bridge — Multi-Bot Edition
-Each bot runs independently via @larksuite/cli event daemon + Claude Code CLI.
+Each bot uses lark-cli for event streaming + httpx for API calls.
 """
 import argparse
 import json
@@ -21,6 +21,22 @@ if sys.platform == "win32":
 
 import httpx
 
+
+def _kill_process(pid: int):
+    """Kill a process tree. On Windows, TerminateProcess leaves orphans;
+    taskkill /T ensures all descendants are cleaned up."""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, timeout=10,
+        )
+    else:
+        import signal
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
 if getattr(sys, 'frozen', False):
     APP_DIR = Path(sys.executable).parent
 else:
@@ -28,22 +44,62 @@ else:
 
 CONFIG_PATH = APP_DIR / "bridge-config.json"
 DATA_DIR = APP_DIR
-CLI_SESSIONS_DIR = DATA_DIR / ".cli-sessions"  # dedicated cwd for Claude CLI subprocess
+CLI_SESSIONS_DIR = DATA_DIR / ".cli-sessions"
+MEDIA_DIR = DATA_DIR / ".bridge-media"
 
-# Resolve lark-cli binary (handle Windows .cmd extension)
-_LARK_CLI = shutil.which("lark-cli")
-if not _LARK_CLI:
-    _LARK_CLI = shutil.which("lark-cli.cmd")
+_LARK_CLI = shutil.which("lark-cli") or shutil.which("lark-cli.cmd")
 if not _LARK_CLI:
     _npm_root = os.path.expandvars(r"%APPDATA%\npm")
-    for _candidate in ["lark-cli.cmd", "lark-cli"]:
-        _p = os.path.join(_npm_root, _candidate)
+    for _c in ["lark-cli.cmd", "lark-cli"]:
+        _p = os.path.join(_npm_root, _c)
         if os.path.exists(_p):
             _LARK_CLI = _p
             break
 if not _LARK_CLI:
     _LARK_CLI = "lark-cli"
 LARK_CLI = _LARK_CLI
+
+
+def _lark_env() -> dict:
+    env = os.environ.copy()
+    env["USERPROFILE"] = str(APP_DIR)
+    return env
+
+
+def _lark(*args, **kwargs):
+    """Run lark-cli with project-scoped env. Returns subprocess.CompletedProcess."""
+    return subprocess.run(
+        [LARK_CLI] + list(args),
+        capture_output=True, text=True, timeout=15,
+        env=_lark_env(), **kwargs
+    )
+
+
+def _sync_profiles(bots_cfg: dict):
+    """Auto-register profiles in project-scoped .lark-cli. Runs once on startup."""
+    try:
+        r = _lark("profile", "list")
+        existing = {p["name"]: p.get("active", False)
+                    for p in json.loads(r.stdout)} if r.returncode == 0 else {}
+    except Exception:
+        existing = {}
+
+    for name, bot_cfg in bots_cfg.items():
+        app_id = bot_cfg.get("feishu_app_id", "")
+        app_secret = bot_cfg.get("feishu_app_secret", "")
+        if not app_id or not app_secret:
+            continue
+        if name in existing:
+            print(f"  [OK] profile '{name}' exists")
+            continue
+        print(f"  [{name}] Registering profile...")
+        r = _lark("profile", "add", "--name", name, "--app-id", app_id,
+                   "--brand", "feishu", "--app-secret-stdin",
+                   input=app_secret)
+        if r.returncode != 0:
+            print(f"  [{name}] WARN: {r.stderr or r.stdout}")
+        else:
+            print(f"  [{name}] profile registered")
 
 
 def load_json(path: Path, default):
@@ -62,42 +118,28 @@ def save_json(path: Path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def resolve_claude(bot_name: str, bot_cfg: dict, all_cfg: dict) -> dict:
-    """Extract the claude block. system_prompt is required."""
-    cc = bot_cfg.get("claude") or {}
-    if not cc.get("system_prompt"):
-        raise RuntimeError(f"Bot '{bot_name}' has no claude.system_prompt configured")
-    return cc
-
-
 def load_config():
-    """Load config, normalising old flat format to new bots dict. Resolves Claude inheritance."""
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-
-    # Backward compat: flat format -> single "default" bot
     if "bots" not in cfg:
         cfg = {
             "bots": {
                 "default": {
-                    "feishu_profile": "bridge",
                     "feishu_app_id": cfg["feishu"]["app_id"],
                     "feishu_app_secret": cfg["feishu"]["app_secret"],
                     "claude": cfg["claude"],
-                    "max_context_messages": cfg.get("bridge", {}).get("max_context_messages", 20),
                 }
             }
         }
-
-    # Resolve Claude config for bots that don't specify one
     for name, bot_cfg in cfg["bots"].items():
-        bot_cfg["claude"] = resolve_claude(name, bot_cfg, cfg)
-
+        cc = bot_cfg.get("claude") or {}
+        if not cc.get("system_prompt"):
+            raise RuntimeError(f"Bot '{name}' has no claude.system_prompt configured")
     return cfg
 
 
 # ===========================================================================
-# BotRunner — one per bot, fully independent
+# BotRunner
 # ===========================================================================
 
 class BotRunner:
@@ -108,7 +150,6 @@ class BotRunner:
         self.system_prompt = cc["system_prompt"]
         self.display_name = config.get("display_name", name)
 
-        self.feishu_profile = config["feishu_profile"]
         self.feishu_app_id = config["feishu_app_id"]
         self.feishu_app_secret = config["feishu_app_secret"]
         self.feishu_base = "https://open.feishu.cn"
@@ -167,8 +208,98 @@ class BotRunner:
             if data.get("code") != 0:
                 print(f"[{self.name}] Reply error: {data}")
 
+    async def _send_message(self, receive_id: str, msg_type: str,
+                            content: str, *, title: str = "") -> str:
+        token = await self._get_token()
+        body = {"receive_id": receive_id, "msg_type": msg_type, "content": content}
+        if title:
+            body["title"] = title
+        async with httpx.AsyncClient() as cli:
+            r = await cli.post(
+                f"{self.feishu_base}/open-apis/im/v1/messages",
+                headers={"Authorization": f"Bearer {token}"},
+                json=body,
+            )
+            data = r.json()
+            if data.get("code") != 0:
+                print(f"[{self.name}] Send error: {data}")
+                return ""
+            return data.get("data", {}).get("message_id", "")
+
+    async def _get_chat_info(self, chat_id: str) -> dict:
+        token = await self._get_token()
+        async with httpx.AsyncClient() as cli:
+            r = await cli.get(
+                f"{self.feishu_base}/open-apis/im/v1/chats/{chat_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            data = r.json()
+            return data.get("data", {}) if data.get("code") == 0 else {}
+
+    async def _get_chat_members(self, chat_id: str) -> list[dict]:
+        token = await self._get_token()
+        members, page_token = [], ""
+        async with httpx.AsyncClient() as cli:
+            while True:
+                params = {"page_size": 50}
+                if page_token:
+                    params["page_token"] = page_token
+                r = await cli.get(
+                    f"{self.feishu_base}/open-apis/im/v1/chats/{chat_id}/members",
+                    headers={"Authorization": f"Bearer {token}"}, params=params,
+                )
+                data = r.json()
+                if data.get("code") != 0:
+                    break
+                d = data.get("data", {})
+                members.extend(d.get("items", []))
+                if not d.get("has_more"):
+                    break
+                page_token = d.get("page_token", "")
+                if not page_token:
+                    break
+        return members
+
+    async def _get_user_info(self, open_id: str) -> dict:
+        token = await self._get_token()
+        async with httpx.AsyncClient() as cli:
+            r = await cli.get(
+                f"{self.feishu_base}/open-apis/contact/v3/users/{open_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            data = r.json()
+            return data.get("data", {}).get("user", {}) if data.get("code") == 0 else {}
+
+    async def _upload_image(self, image_path: str) -> str:
+        token = await self._get_token()
+        fname = os.path.basename(image_path)
+        async with httpx.AsyncClient() as cli:
+            r = await cli.post(
+                f"{self.feishu_base}/open-apis/im/v1/images",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"image_type": "message"},
+                files={"image": (fname, open(image_path, "rb"), "application/octet-stream")},
+            )
+            data = r.json()
+            return data.get("data", {}).get("image_key", "") if data.get("code") == 0 else ""
+
+    async def _upload_file(self, file_path: str) -> tuple[str, str]:
+        token = await self._get_token()
+        fname = os.path.basename(file_path)
+        async with httpx.AsyncClient() as cli:
+            r = await cli.post(
+                f"{self.feishu_base}/open-apis/im/v1/files",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"file_type": "stream", "file_name": fname},
+                files={"file": (fname, open(file_path, "rb"), "application/octet-stream")},
+            )
+            data = r.json()
+            if data.get("code") != 0:
+                return "", ""
+            d = data.get("data", {})
+            return d.get("file_key", ""), fname
+
     async def _add_reaction(self, message_id: str, emoji_type: str) -> str:
-        """Add an emoji reaction. Returns reaction_id (empty on failure)."""
         token = await self._get_token()
         async with httpx.AsyncClient() as cli:
             r = await cli.post(
@@ -178,14 +309,11 @@ class BotRunner:
             )
             data = r.json()
             if data.get("code") != 0:
-                print(f"[{self.name}] Reaction error ({emoji_type}): {data}")
+                print(f"[{self.name}] Reaction error: {data}")
                 return ""
-            reaction_id = data.get("data", {}).get("reaction_id", "")
-            print(f"[{self.name}] Reaction added: {emoji_type} id={reaction_id[:8]}...")
-            return reaction_id
+            return data.get("data", {}).get("reaction_id", "")
 
     async def _remove_reaction(self, message_id: str, reaction_id: str):
-        """Remove a previously added reaction."""
         if not reaction_id:
             return
         token = await self._get_token()
@@ -199,7 +327,6 @@ class BotRunner:
                 print(f"[{self.name}] Remove reaction error: {data}")
 
     async def _get_mentions(self, message_id: str) -> set[str]:
-        """Return the set of open_ids @mentioned in a message."""
         try:
             token = await self._get_token()
             async with httpx.AsyncClient() as cli:
@@ -209,14 +336,12 @@ class BotRunner:
                 )
             data = r.json()
             if data.get("code") != 0:
-                print(f"[{self.name}] mentions API error: code={data.get('code')} msg={data.get('msg')}")
                 return set()
             items = data.get("data", {}).get("items", [])
             if not items:
                 return set()
-            mentions_raw = items[0].get("mentions", [])
             ids = set()
-            for m in mentions_raw:
+            for m in items[0].get("mentions", []):
                 if isinstance(m, str):
                     ids.add(m)
                 elif isinstance(m, dict):
@@ -227,16 +352,13 @@ class BotRunner:
                             ids.add(oid)
                     elif isinstance(id_field, str):
                         ids.add(id_field)
-                    direct_oid = m.get("open_id", "")
-                    if direct_oid:
-                        ids.add(direct_oid)
+                    if m.get("open_id"):
+                        ids.add(m["open_id"])
             return ids
-        except Exception as e:
-            print(f"[{self.name}] mentions API failed: {e}")
+        except Exception:
             return set()
 
     def _resolve_sender(self, sender_id: str) -> str:
-        """Resolve sender_id to a display name. Returns empty string for unknown users."""
         if not sender_id:
             return ""
         for s in self._siblings:
@@ -245,7 +367,7 @@ class BotRunner:
         return ""
 
     def _replace_at_tags(self, text: str) -> str:
-        """Replace @display_name mentions with proper Feishu <at> tags."""
+        text = text.replace("@所有人", '<at user_id="all">所有人</at>')
         for s in self._siblings:
             name = s["display_name"]
             at_tag = f'<at user_id="{s["open_id"]}">{name}</at>'
@@ -255,7 +377,6 @@ class BotRunner:
     # -- Claude CLI --
 
     def _call_claude_sync(self, session_key: str, user_msg: str) -> str:
-        """Call Claude CLI. Creates the session on first use, resumes thereafter."""
         session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"bridge.{self.name}.{session_key}"))
         session_name = f"bridge-{self.name}-{session_key.replace(':', '-').replace('/', '-')}"
         system_prompt = f"你的名字叫{self.display_name}。{self.system_prompt}"
@@ -264,18 +385,21 @@ class BotRunner:
         base = ["claude", "-p", user_msg,
                 "--name", session_name,
                 "--permission-mode", self.cli_cfg.get("permission_mode", "auto"),
-                "--output-format", "text"]
+                "--output-format", "text",
+                "--dangerously-skip-permissions"]
         if self.cli_cfg.get("model"):
             base += ["--model", self.cli_cfg["model"]]
-        if self.cli_cfg.get("allowed_tools"):
-            base += ["--allowedTools", ",".join(self.cli_cfg["allowed_tools"])]
         for d in self.cli_cfg.get("add_dirs", []):
             base += ["--add-dir", d]
+        # Always allow media download directory
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        base += ["--add-dir", str(MEDIA_DIR)]
         if self.cli_cfg.get("max_turns"):
             base += ["--max-turns", str(self.cli_cfg["max_turns"])]
         if self.cli_cfg.get("max_budget_usd"):
             base += ["--max-budget-usd", str(self.cli_cfg["max_budget_usd"])]
         env = os.environ.copy()
+        env["USERPROFILE"] = str(APP_DIR)
         env.update(self.cli_cfg.get("env", {}))
 
         def run(args):
@@ -305,8 +429,7 @@ class BotRunner:
         if not stdout:
             print(f"[{self.name}] CLI empty stdout, stderr={stderr[:200]}")
             return "[错误] Claude CLI 返回为空"
-        text = stdout.strip()
-        return text
+        return stdout.strip()
 
     async def _call_claude_async(self, session_key: str, user_msg: str) -> str:
         loop = asyncio.get_running_loop()
@@ -314,14 +437,87 @@ class BotRunner:
             None, functools.partial(self._call_claude_sync, session_key, user_msg)
         )
 
-    # -- Event handler --
+    async def _download_resource(self, message_id: str, file_key: str, file_type: str,
+                                  save_dir: str) -> str | None:
+        """Download media from Feishu, return local path or None."""
+        token = await self._get_token()
+        async with httpx.AsyncClient(timeout=30) as cli:
+            r = await cli.get(
+                f"{self.feishu_base}/open-apis/im/v1/messages/{message_id}"
+                f"/resources/{file_key}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"type": file_type},
+            )
+            if r.status_code != 200:
+                print(f"[{self.name}] Download {file_type} failed: {r.status_code}")
+                return None
+            content_type = r.headers.get("content-type", "")
+            ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                   "image/webp": ".webp", "application/pdf": ".pdf",
+                   "text/plain": ".txt", "application/octet-stream": ".bin"}
+            suffix = ext.get(content_type.split(";")[0].strip(), "")
+            fname = f"{file_key}{suffix}"
+            path = os.path.join(save_dir, fname)
+            with open(path, "wb") as f:
+                f.write(r.content)
+            print(f"[{self.name}] Downloaded {file_type}: {fname} ({len(r.content)} bytes)")
+            return path
+
+    @staticmethod
+    def _extract_media_keys(event: dict) -> list[tuple[str, str]]:
+        """Parse message content for image/file/media keys. Returns [(type, key), ...]."""
+        content_str = event.get("content", "")
+        try:
+            content = json.loads(content_str) if content_str else {}
+        except json.JSONDecodeError:
+            return []
+        keys = []
+        if "image_key" in content:
+            keys.append(("image", content["image_key"]))
+        if "file_key" in content:
+            keys.append(("file", content["file_key"]))
+        if "image_keys" in content:
+            for k in content["image_keys"]:
+                keys.append(("image", k))
+        return keys
+
+    async def _build_media_message(self, message_id: str, event: dict,
+                                    msg_type: str) -> str | None:
+        """Download attached media and return a prompt referencing local files."""
+        keys = self._extract_media_keys(event)
+        if not keys:
+            # Try content text fallback (e.g. image with caption)
+            content = event.get("content", "").strip()
+            if content and not content.startswith("{"):
+                return content
+            return None
+
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for ftype, fkey in keys:
+            path = await self._download_resource(message_id, fkey, ftype, str(MEDIA_DIR))
+            if path:
+                paths.append((ftype, path))
+
+        if not paths:
+            return None
+
+        labels = []
+        for ftype, path in paths:
+            labels.append(f"  [{ftype}] {path}")
+        media_lines = "\n".join(labels)
+
+        text_hint = ""
+        content = event.get("content", "").strip()
+        if content and not content.startswith("{"):
+            text_hint = f"\n附言: {content}"
+
+        return f"用户发送了以下文件，你可以用 Read 工具查看:\n{media_lines}{text_hint}"
 
     async def _handle_event(self, event: dict):
         if not isinstance(event, dict):
             return
         msg_type = event.get("message_type", "")
-        if msg_type != "text":
-            return
 
         chat_id = event.get("chat_id", "")
         chat_type = event.get("chat_type", "p2p")
@@ -337,10 +533,8 @@ class BotRunner:
                     sender_id = sid
         content = event.get("content", "").strip()
 
-        if not content or not message_id:
+        if not message_id:
             return
-
-        # Dedup
         if message_id in self.last_msg_ids or message_id in self._processing:
             return
         self._processing.add(message_id)
@@ -352,27 +546,42 @@ class BotRunner:
             self.last_msg_ids = dict(sorted_ids[:500])
 
         try:
-            await self._handle_event_inner(message_id, chat_id, chat_type, sender_id, content)
+            await self._handle_event_inner(message_id, chat_id, chat_type,
+                                            sender_id, content, msg_type, event)
         finally:
             self._processing.discard(message_id)
 
-    async def _handle_event_inner(self, message_id, chat_id, chat_type, sender_id, content):
-        sender_name = self._resolve_sender(sender_id)
-        enriched = f"[发送者: {sender_name}] {content}" if sender_name else content
-
-        print(f"[{self.name}] {chat_type}:{chat_id[:12]}... | {enriched[:80]}")
-
+    async def _handle_event_inner(self, message_id, chat_id, chat_type, sender_id,
+                                   content, msg_type="text", event=None):
         session_key = f"{chat_type}:{chat_id}"
 
-        # Group messages: only reply if @mentioned
+        # Build the user message for Claude
+        if msg_type == "text":
+            if not content:
+                return
+            user_msg = content
+        elif msg_type in ("image", "file", "media", "audio"):
+            user_msg = await self._build_media_message(message_id, event or {}, msg_type)
+            if not user_msg:
+                return
+        else:
+            return  # unsupported message type
+
+        sender_name = self._resolve_sender(sender_id)
+        if sender_name:
+            user_msg = f"[发送者: {sender_name}] {user_msg}"
+
+        print(f"[{self.name}] {msg_type} {chat_type}:{chat_id[:12]}... | {user_msg[:80]}")
+
         if chat_type == "group" and self._bot_open_id:
             mentioned_ids = await self._get_mentions(message_id)
-            if self._bot_open_id not in mentioned_ids:
+            is_at_all = "all" in mentioned_ids or "@_all" in content or "@所有人" in content
+            if self._bot_open_id not in mentioned_ids and not is_at_all:
                 return
 
         reaction = self.cli_cfg.get("reaction_emoji", "Typing")
         reaction_id = await self._add_reaction(message_id, reaction)
-        reply = await self._call_claude_async(session_key, content)
+        reply = await self._call_claude_async(session_key, user_msg)
         reply = self._replace_at_tags(reply)
 
         for i in range(0, len(reply), 7000):
@@ -384,20 +593,22 @@ class BotRunner:
     # -- Event stream (lark-cli subprocess) --
 
     async def run(self):
-        """Connect to Feishu via lark-cli and process events. Reconnects on failure."""
-        print(f"[{self.name}] Starting event stream, profile={self.feishu_profile}")
+        """Connect to Feishu via lark-cli event consume."""
+        print(f"[{self.name}] Starting event stream, profile={self.name}")
 
         while True:
             proc = await asyncio.create_subprocess_exec(
                 LARK_CLI, "event", "consume", "im.message.receive_v1",
-                "--profile", self.feishu_profile,
+                "--as", "bot",
+                "--profile", self.name,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=_lark_env(),
             )
-            print(f"[{self.name}] CLI consumer started (pid={proc.pid})")
+            print(f"[{self.name}] Consumer started (pid={proc.pid})")
 
-            async def read_stderr():
+            async def _read_stderr():
                 while True:
                     line = await proc.stderr.readline()
                     if not line:
@@ -406,7 +617,7 @@ class BotRunner:
                     if text:
                         print(f"[{self.name}] {text}")
 
-            stderr_task = asyncio.create_task(read_stderr())
+            stderr_task = asyncio.create_task(_read_stderr())
 
             try:
                 while True:
@@ -432,61 +643,22 @@ class BotRunner:
                     pass
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-                print(f"[{self.name}] CLI consumer stopped")
+                except (asyncio.TimeoutError, Exception):
+                    if proc.pid:
+                        _kill_process(proc.pid)
+                    try:
+                        await proc.wait()
+                    except Exception:
+                        pass
+                if proc.pid:
+                    _kill_process(proc.pid)
+                print(f"[{self.name}] Consumer stopped")
 
             await asyncio.sleep(5)
 
 
 # ===========================================================================
-# Profile auto-registration
-# ===========================================================================
-
-def _get_profiles() -> dict[str, bool]:
-    """Return dict of {profile_name: is_active} from lark-cli."""
-    try:
-        r = subprocess.run(
-            [LARK_CLI, "profile", "list"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if r.returncode != 0:
-            return {}
-        profiles = json.loads(r.stdout)
-        return {p["name"]: p.get("active", False) for p in profiles}
-    except Exception:
-        return {}
-
-
-def _sync_profiles(bots_cfg: dict):
-    """Ensure every bot's feishu_profile exists in lark-cli. Auto-create if missing."""
-    existing = _get_profiles()
-
-    for name, bot_cfg in bots_cfg.items():
-        profile = bot_cfg.get("feishu_profile", "")
-        app_id = bot_cfg.get("feishu_app_id", "")
-        app_secret = bot_cfg.get("feishu_app_secret", "")
-        if not profile or not app_id or not app_secret:
-            continue
-        if profile in existing:
-            print(f"  [OK] profile '{profile}' exists")
-            continue
-
-        print(f"  [{name}] Registering profile '{profile}' (app: {app_id[:14]}...) ...")
-        r = subprocess.run(
-            [LARK_CLI, "profile", "add", "--name", profile, "--app-id", app_id,
-             "--brand", "feishu", "--use", "--app-secret-stdin"],
-            input=app_secret, capture_output=True, text=True, timeout=15,
-        )
-        if r.returncode != 0:
-            print(f"  [{name}] WARN: profile register failed: {r.stderr or r.stdout}")
-        else:
-            print(f"  [{name}] profile '{profile}' registered")
-
-
-# ===========================================================================
-# Bridge — orchestrates all bots
+# Bridge
 # ===========================================================================
 
 class Bridge:
@@ -504,11 +676,9 @@ class Bridge:
         print("=" * 55)
         print(f"Claude <-> Feishu Bridge — {len(self.bots)} bot(s)")
         for bot in self.bots:
-            model_info = bot.cli_cfg.get("model", "default")
-            print(f"  [{bot.name}] profile={bot.feishu_profile} model={model_info}")
+            print(f"  [{bot.name}] app={bot.feishu_app_id[:14]}...")
         print("=" * 55)
 
-        # Resolve all bot identities
         all_ids: set[str] = set()
         for bot in self.bots:
             try:
@@ -547,9 +717,9 @@ class Bridge:
 
 def main():
     parser = argparse.ArgumentParser(description="Claude <-> Feishu Bridge")
-    parser.add_argument("--gui", action="store_true", help="Start web dashboard alongside the bridge")
-    parser.add_argument("--port", type=int, default=8080, help="GUI port (default: 8080)")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="GUI bind address (default: 127.0.0.1)")
+    parser.add_argument("--gui", action="store_true", help="Start web dashboard")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     args = parser.parse_args()
 
     if not CONFIG_PATH.exists():
@@ -557,11 +727,11 @@ def main():
         sys.exit(1)
 
     if not shutil.which(LARK_CLI):
-        print(f"ERROR: {LARK_CLI} not found in PATH.")
-        print("Install: npm install -g @larksuite/cli")
+        print(f"ERROR: {LARK_CLI} not found in PATH. Install: npm install -g @larksuite/cli")
         sys.exit(1)
 
     CLI_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
     gui_server = None
     if args.gui:
@@ -571,7 +741,6 @@ def main():
         gui_path = str(APP_DIR / "bridge-gui.py")
         gui_module = SourceFileLoader("bridge_gui", gui_path).load_module()
         gui_app = gui_module.create_app(embedded=True)
-
         gui_module.install_log_tee()
 
         config = uvicorn.Config(gui_app, host=args.host, port=args.port, log_level="warning")
