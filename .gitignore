@@ -22,5 +22,7 @@ AppData/
 # PyInstaller
 build/
 dist/
+.agents/
 *.spec
 *.exe
+.claude.json

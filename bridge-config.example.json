@@ -10,13 +10,19 @@
       },
       "claude_cli": {
         "model": "deepseek-v4-pro[1m]",
-        "permission_mode": "auto",
+        "permission_mode": "default",
+        "_permission_mode_comment": "One of: default, accept-edits, bypass-permissions, auto, dont-ask, plan",
         "allowed_tools": ["Bash", "Edit", "Read", "Write", "Glob", "Grep"],
         "add_dirs": ["C:\\Users\\yourname\\Desktop"],
         "max_turns": 20,
-        "timeout_seconds": 120,
+        "timeout_seconds": 300,
+        "stream_edit": false,
+        "stream_throttle_ms": 500,
         "reaction_emoji": "Typing"
       },
+      "webhook_host": "127.0.0.1",
+      "webhook_port": 0,
+      "_webhook_comment": "Set webhook_port>0 to receive card.action.trigger events. Configure Feishu app's event callback URL to http://<public-host>:<port>/",
       "max_context_messages": 20
     }
   }

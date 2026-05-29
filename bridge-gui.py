@@ -127,18 +127,23 @@ def install_log_tee():
     sys.stdout = LogTee(sys.stdout)
 
 
-def _lark_env() -> dict:
+def _lark_env(bot_name: str = "") -> dict:
     env = os.environ.copy()
-    env["USERPROFILE"] = str(BRIDGE_DIR)
+    if bot_name:
+        home = BRIDGE_DIR / f".lark-home-{bot_name}"
+        home.mkdir(parents=True, exist_ok=True)
+        env["USERPROFILE"] = str(home)
+    else:
+        env["USERPROFILE"] = str(BRIDGE_DIR)
     return env
 
 
-def run_lark(*args) -> tuple[int, str, str]:
+def run_lark(*args, bot_name: str = "") -> tuple[int, str, str]:
     try:
         r = subprocess.run(
             [LARK_CLI, *args],
             capture_output=True, text=True, timeout=15,
-            env=_lark_env(),
+            env=_lark_env(bot_name),
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception as e:
@@ -297,7 +302,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <summary>Claude CLI Settings</summary>
       <div class="form-row" style="margin-top:8px">
         <div class="form-group"><label>Model <span class="help-text">(optional, env var takes precedence)</span></label><input id="bmModel" placeholder="default"></div>
-        <div class="form-group"><label>Permission Mode</label><select id="bmPermMode"><option value="auto">auto</option><option value="acceptEdits">acceptEdits</option><option value="default">default</option></select></div>
+        <div class="form-group"><label>Permission Mode</label><select id="bmPermMode"><option value="default">default</option><option value="accept-edits">accept-edits</option><option value="bypass-permissions">bypass-permissions</option><option value="auto">auto</option><option value="dont-ask">dont-ask</option><option value="plan">plan</option></select></div>
       </div>
       <div class="form-row">
         <div class="form-group"><label>Max Turns</label><input id="bmMaxTurns" type="number" value="20"></div>
@@ -765,18 +770,22 @@ def create_app(embedded: bool = False):
 
     @app.get("/api/profiles")
     async def api_list_profiles():
-        code, stdout, stderr = run_lark("profile", "list")
-        if code != 0:
-            return {"profiles": [], "error": stderr}
-        try:
-            profiles = json.loads(stdout)
-            return {"profiles": profiles}
-        except json.JSONDecodeError:
-            return {"profiles": [], "error": stdout}
+        cfg = load_config()
+        profiles = []
+        for bot_name in cfg.get("bots", {}):
+            code, stdout, stderr = run_lark("profile", "list", bot_name=bot_name)
+            if code == 0:
+                try:
+                    for p in json.loads(stdout):
+                        p["_home"] = bot_name
+                        profiles.append(p)
+                except json.JSONDecodeError:
+                    pass
+        return {"profiles": profiles}
 
     @app.delete("/api/profiles/{name}")
     async def api_remove_profile(name: str):
-        code, stdout, stderr = run_lark("profile", "remove", name)
+        code, stdout, stderr = run_lark("profile", "remove", name, bot_name=name)
         if code != 0:
             raise HTTPException(400, stderr or stdout)
         return {"ok": True}
@@ -793,7 +802,7 @@ def create_app(embedded: bool = False):
         r = subprocess.run(
             [LARK_CLI, "profile", "add", "--name", name, "--app-id", app_id, "--brand", brand, "--use", "--app-secret-stdin"],
             input=app_secret, capture_output=True, text=True, timeout=15,
-            env=_lark_env(),
+            env=_lark_env(name),
         )
         if r.returncode != 0:
             raise HTTPException(400, r.stderr or r.stdout)

@@ -1,31 +1,34 @@
 # Claude <-> Feishu Bridge
 
-将 Claude Code CLI 接入飞书群聊，支持多机器人协作、实时事件流和会话持久化。
+将 Claude Code CLI 接入飞书群聊，支持多机器人协作、卡片交互和会话持久化。
 
 ## 架构
 
 ```
 bridge.py [--gui]
 ├── Web Dashboard (FastAPI + WebSocket)        ← http://127.0.0.1:8080
-├── BotRunner "honglong"     BotRunner "xiaohong"     BotRunner "xiaolong"
-│   ├── lark-cli event consume (WebSocket)     ← 飞书事件流
-│   ├── lark-cli bus daemon                    ← 本地消息总线 (30s 空闲自动退出)
-│   └── claude -p --resume                     ← Claude CLI 子进程
-└── asyncio 并发调度，每个 Bot 独立运行互不阻塞
+├── lark_oapi SDK WebSocket (dedicated thread)  ← 飞书长连接
+│   ├── honglong:  messages + card actions
+│   ├── xiaohong:  messages + card actions
+│   └── xiaolong:  messages + card actions
+└── Claude CLI 子进程 (per message)
 ```
 
 - 每个 Bot 独立：自己的飞书应用凭证、WebSocket 连接、Claude 会话
-- 会话通过 UUID5 (`bridge.{name}.{chat}`) 确定性生成，重启不丢失
-- 机器人间可互相 @ 协作，自动转换为飞书 `<at>` 标签
+- 统一使用 lark_oapi SDK 长连接，一个线程管理所有 WebSocket
+- 会话通过 UUID 确定性生成，重启不丢失
+- 机器人间可互相 @ 协作
 - 群聊中仅响应 @提及或 @所有人，私聊全部响应
 - 支持图片/文件下载，Claude 可直接 Read 附件
+- 支持卡片交互回调（按钮点击 → 更新卡片 + 发送给 Claude 处理）
 
 ## 依赖
 
 | 类型 | 名称 | 用途 |
 |------|------|------|
 | CLI | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | AI 引擎 |
-| CLI | [lark-cli](https://www.npmjs.com/package/@larksuite/cli) | 飞书事件订阅 |
+| CLI | [lark-cli](https://www.npmjs.com/package/@larksuite/cli) | Profile 管理 |
+| Python | [lark-oapi](https://pypi.org/project/lark-oapi/) | 飞书 WebSocket 事件流 + 卡片回调 |
 | Python | httpx | 飞书 REST API |
 | Python | fastapi + uvicorn | Web 管理面板 (`--gui`) |
 
@@ -38,7 +41,7 @@ bridge.py [--gui]
 
 git clone git@github.com:banchen21/claude-feishu-bridge.git
 cd claude-feishu-bridge
-pip install httpx fastapi uvicorn
+pip install httpx fastapi uvicorn lark-oapi
 npm install -g @larksuite/cli
 ```
 
@@ -49,6 +52,7 @@ npm install -g @larksuite/cli
 1. [飞书开放平台](https://open.feishu.cn) → 创建企业自建应用
 2. 权限：`im:message`、`im:message:read`、`im:message.reactions:write_only`
 3. 开启机器人能力，发布版本并审批
+4. 事件订阅 → 选择「长连接」方式 → 添加 `im.message.receive_v1`
 
 ### 3. 配置
 
@@ -80,8 +84,6 @@ cp bridge-config.example.json bridge-config.json
 }
 ```
 
-Profile 无需手动创建，启动时自动注册。
-
 ### 4. 启动
 
 ```bash
@@ -94,7 +96,7 @@ python bridge.py
 python bridge.py --gui
 ```
 
-看到 `ready event_key=im.message.receive_v1` 即连接成功。
+看到 `Feishu WS connected` 即连接成功。
 
 ## 配置参考
 
@@ -102,7 +104,7 @@ python bridge.py --gui
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `bots.<key>` | object | Bot 标识，也是 lark-cli profile 名 |
+| `bots.<key>` | object | Bot 标识 |
 | `display_name` | string | 群内显示名称 |
 | `feishu_app_id` | string | 飞书应用 App ID |
 | `feishu_app_secret` | string | 飞书应用 App Secret |
@@ -113,6 +115,7 @@ python bridge.py --gui
 | `claude_cli.max_turns` | int | 最大对话轮次，默认 20 |
 | `claude_cli.timeout_seconds` | int | 超时秒数，默认 120 |
 | `claude_cli.reaction_emoji` | string | 处理中表情，默认 `Typing` |
+| `claude_cli.stream_edit` | bool | 流式编辑模式，默认 false |
 | `max_context_messages` | int | 消息去重上限，默认 20 |
 
 ### Claude Code 环境变量
@@ -156,6 +159,7 @@ claude-feishu-bridge/
 ├── bridge-config.example.json # 配置模板
 ├── .claude/settings.json      # Claude Code 项目级设置
 ├── .cli-sessions/             # Claude CLI 会话工作目录
+├── .bridge-media/             # 下载的媒体文件
 └── .gitignore
 ```
 
